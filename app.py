@@ -3,6 +3,7 @@ from backend import *
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import date
+from fpdf import FPDF
 
 st.set_page_config(page_title="Library System", layout="wide")
 
@@ -29,14 +30,18 @@ if st.session_state.role is None:
                 st.error("Invalid Credentials")
 
     else:
-        sid = st.number_input("Student ID")
+        sid = st.text_input("Student ID")
         p = st.text_input("Password", type="password")
 
         if st.button("Login"):
-            user = student_login(sid, p)
+            if sid.isdigit():
+                user = student_login(int(sid), p)
+            else:
+                user = None
+
             if user:
                 st.session_state.role = "student"
-                st.session_state.sid = sid
+                st.session_state.sid = int(sid)
                 st.success("Login Successful")
             else:
                 st.error("❌ Not found. Contact Admin")
@@ -72,7 +77,29 @@ elif st.session_state.role == "student":
         st.subheader("🔍 Search Books")
 
         filter_type = st.selectbox("Filter By", ["Title", "Author", "Genre"])
-        query = st.text_input("Enter value")
+        query_key = "student_search_query"
+        if query_key not in st.session_state:
+            st.session_state[query_key] = ""
+
+        query = st.text_input("Enter ", value=st.session_state[query_key], key=query_key)
+
+        suggestions = []
+        if query.strip():
+            conn = connect_db()
+            if filter_type == "Title":
+                suggestion_sql = f"SELECT book_id, title, author, shelf_no, available_copies FROM books WHERE title LIKE '%{query}%' AND available_copies > 0 LIMIT 10"
+            elif filter_type == "Author":
+                suggestion_sql = f"SELECT book_id, title, author, shelf_no, available_copies FROM books WHERE author LIKE '%{query}%' AND available_copies > 0 LIMIT 10"
+            else:
+                suggestion_sql = f"SELECT book_id, title, author, shelf_no, available_copies FROM books WHERE genre LIKE '%{query}%' AND available_copies > 0 LIMIT 10"
+
+            df_suggestions = pd.read_sql(suggestion_sql, conn)
+            conn.close()
+
+            if not df_suggestions.empty:
+                st.info("Available books")
+                for _, row in df_suggestions.iterrows():
+                    st.write(f"🔹 Book ID: {row['book_id']} | {row['title']} | {row['author']} | Available: {row['available_copies']} | Shelf: {row['shelf_no']}")
 
         if st.button("Search"):
             conn = connect_db()
@@ -88,7 +115,7 @@ elif st.session_state.role == "student":
 
             for _, row in df.iterrows():
                 availability = "Yes" if row['available_copies'] > 0 else "No"
-                st.write(f"📘 {row['title']} | {row['author']} | Available: {availability} | Shelf: {row['shelf_no']}")
+                st.write(f"📘 Book ID: {row['book_id']} | {row['title']} | {row['author']} | Available: {availability} | Shelf: {row['shelf_no']}")
 
     elif menu == "My Books":
         df = pd.read_sql(f"""
@@ -121,8 +148,9 @@ elif st.session_state.role == "admin":
         pwd = st.text_input("Password")
 
         if st.button("Register"):
-            register_student(name, email, dept, pwd)
+            student_id = register_student(name, email, dept, pwd)
             st.success("Student Registered")
+            st.info(f"Student ID: {student_id}")
 
     # 🔍 SEARCH
     elif menu == "Search Books":
@@ -144,20 +172,74 @@ elif st.session_state.role == "admin":
 
     # ISSUE
     elif menu == "Issue":
-        sid = st.number_input("Student ID")
-        bid = st.number_input("Book ID")
+        sid_input = st.text_input("Student ID")
+        bid_input = st.text_input("Book ID")
 
         if st.button("Issue"):
-            issue_book(sid, bid)
-            st.success("Book Issued")
+            if sid_input.isdigit() and bid_input.isdigit():
+                transaction_id = issue_book(int(sid_input), int(bid_input))
+                if transaction_id:
+                    st.success("Book Issued")
+
+                    conn = connect_db()
+                    receipt_sql = """
+                        SELECT t.transaction_id, t.issue_date, s.student_id, s.name AS student_name,
+                               b.book_id, b.title AS book_name
+                        FROM transactions t
+                        JOIN students s ON t.student_id = s.student_id
+                        JOIN books b ON t.book_id = b.book_id
+                        WHERE t.transaction_id = %s
+                    """
+                    receipt_df = pd.read_sql(receipt_sql, conn, params=(transaction_id,))
+                    conn.close()
+
+                    if not receipt_df.empty:
+                        receipt = receipt_df.iloc[0]
+                        issue_date = pd.to_datetime(receipt['issue_date']).date()
+                        due_date = issue_date + pd.Timedelta(days=20)
+                        due_date_str = due_date.strftime('%Y-%m-%d')
+
+                        pdf = FPDF()
+                        pdf.add_page()
+                        pdf.set_font('Arial', 'B', 14)
+                        pdf.cell(0, 10, 'Library Issue Receipt', ln=True, align='C')
+                        pdf.set_font('Arial', '', 12)
+                        pdf.ln(5)
+                        pdf.cell(0, 8, f"Transaction ID: {receipt['transaction_id']}", ln=True)
+                        pdf.cell(0, 8, f"Student Name: {receipt['student_name']}", ln=True)
+                        pdf.cell(0, 8, f"Student ID: {receipt['student_id']}", ln=True)
+                        pdf.cell(0, 8, f"Book Name: {receipt['book_name']}", ln=True)
+                        pdf.cell(0, 8, f"Book ID: {receipt['book_id']}", ln=True)
+                        pdf.cell(0, 8, f"Issue Date: {issue_date}", ln=True)
+                        pdf.cell(0, 8, f"Due Date (no fine if returned by): {due_date_str}", ln=True)
+                        pdf.cell(0, 8, 'Status: issued', ln=True)
+                        pdf.ln(5)
+                        pdf.multi_cell(0, 8, 'Please return the book by the due date to avoid any fine.')
+
+                        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+                        st.download_button(
+                            "Download Issue Receipt",
+                            pdf_bytes,
+                            file_name=f"issue_receipt_{transaction_id}.pdf",
+                            mime="application/pdf"
+                        )
+                    else:
+                        st.error("Unable to load receipt details.")
+                else:
+                    st.error("Book not available or invalid IDs.")
+            else:
+                st.error("Enter valid numeric Student ID and Book ID")
 
     # RETURN
     elif menu == "Return":
-        tid = st.number_input("Transaction ID")
+        tid_input = st.text_input("Transaction ID")
 
         if st.button("Return"):
-            return_book(tid)
-            st.success("Book Returned")
+            if tid_input.isdigit():
+                return_book(int(tid_input))
+                st.success("Book Returned")
+            else:
+                st.error("Enter a valid numeric Transaction ID")
 
     # 📊 ANALYTICS + ML
     elif menu == "Analytics":

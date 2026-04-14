@@ -37,7 +37,9 @@ def register_student(name, email, dept, password):
         VALUES (%s, %s, %s, %s)
     """, (name, email, dept, password))
     conn.commit()
+    student_id = cursor.lastrowid
     conn.close()
+    return student_id
 
 # BOOK SEARCH
 def search_book(title):
@@ -54,13 +56,19 @@ def issue_book(student_id, book_id):
     cursor = conn.cursor()
 
     cursor.execute("SELECT available_copies FROM books WHERE book_id=%s", (book_id,))
-    available = cursor.fetchone()[0]
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        return None
+
+    available = row[0]
 
     if available > 0:
         cursor.execute("""
             INSERT INTO transactions (student_id, book_id, issue_date, status, fine)
             VALUES (%s, %s, CURDATE(), 'issued', 0)
         """, (student_id, book_id))
+        transaction_id = cursor.lastrowid
 
         cursor.execute("""
             UPDATE books SET available_copies = available_copies - 1
@@ -68,8 +76,11 @@ def issue_book(student_id, book_id):
         """, (book_id,))
 
         conn.commit()
+        conn.close()
+        return transaction_id
 
     conn.close()
+    return None
 
 # RETURN
 def return_book(tid):
